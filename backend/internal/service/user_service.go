@@ -10,14 +10,16 @@ import (
 	"io/fs"
 	"log/slog"
 	"path"
+	"slices"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/pocket-id/pocket-id/backend/internal/appconfig"
 	"github.com/pocket-id/pocket-id/backend/internal/apperror"
+	"github.com/pocket-id/pocket-id/backend/internal/backchannellogout"
 	"github.com/pocket-id/pocket-id/backend/internal/dto"
 	"github.com/pocket-id/pocket-id/backend/internal/model"
 	datatype "github.com/pocket-id/pocket-id/backend/internal/model/types"
@@ -33,10 +35,11 @@ type UserService struct {
 	customClaimService *CustomClaimService
 	appImagesService   *AppImagesService
 	scimSyncScheduler  ScimSyncScheduler
+	backchannelLogout  *backchannellogout.Service
 	fileStorage        storage.FileStorage
 }
 
-func NewUserService(db *gorm.DB, jwtService *JwtService, auditLogService *AuditLogService, customClaimService *CustomClaimService, appImagesService *AppImagesService, scimSyncScheduler ScimSyncScheduler, fileStorage storage.FileStorage) *UserService {
+func NewUserService(db *gorm.DB, jwtService *JwtService, auditLogService *AuditLogService, customClaimService *CustomClaimService, appImagesService *AppImagesService, scimSyncScheduler ScimSyncScheduler, backchannelLogout *backchannellogout.Service, fileStorage storage.FileStorage) *UserService {
 	return &UserService{
 		db:                 db,
 		jwtService:         jwtService,
@@ -44,6 +47,7 @@ func NewUserService(db *gorm.DB, jwtService *JwtService, auditLogService *AuditL
 		customClaimService: customClaimService,
 		appImagesService:   appImagesService,
 		scimSyncScheduler:  scimSyncScheduler,
+		backchannelLogout:  backchannelLogout,
 		fileStorage:        fileStorage,
 	}
 }
@@ -88,7 +92,8 @@ func (s *UserService) getUserInternal(ctx context.Context, userID string, tx *go
 
 func (s *UserService) GetProfilePicture(ctx context.Context, userID string) (io.ReadCloser, int64, error) {
 	// Validate the user ID to prevent directory traversal
-	if err := uuid.Validate(userID); err != nil {
+	_, err := uuid.Parse(userID)
+	if err != nil {
 		return nil, 0, apperror.InvalidUserID()
 	}
 
@@ -167,7 +172,7 @@ func (s *UserService) GetUserGroups(ctx context.Context, userID string) ([]model
 
 func (s *UserService) UpdateProfilePicture(ctx context.Context, userID string, file io.ReadSeeker) error {
 	// Validate the user ID to prevent directory traversal
-	err := uuid.Validate(userID)
+	_, err := uuid.Parse(userID)
 	if err != nil {
 		return apperror.InvalidUserID()
 	}
@@ -195,7 +200,18 @@ func (s *UserService) UpdateProfilePicture(ctx context.Context, userID string, f
 }
 
 func (s *UserService) DeleteUser(ctx context.Context, dbConfig *appconfig.AppConfigModel, userID string, allowLdapDelete bool) error {
+	// The user's authorizations are gone after the delete, so the clients to notify must be resolved inside the transaction
+	notifyLogout := func() {}
 	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if s.backchannelLogout != nil {
+			var prepareErr error
+			notifyLogout, prepareErr = s.backchannelLogout.PrepareUserNotifications(ctx, tx, []string{userID})
+			if prepareErr != nil {
+				// Notifications are best effort and must never block the deletion itself
+				slog.ErrorContext(ctx, "Failed to prepare back-channel logout notifications for user", slog.String("userId", userID), slog.Any("error", prepareErr))
+			}
+		}
+
 		return s.DeleteUserInternal(ctx, dbConfig, tx, userID, allowLdapDelete)
 	})
 	if err != nil {
@@ -204,6 +220,7 @@ func (s *UserService) DeleteUser(ctx context.Context, dbConfig *appconfig.AppCon
 	if s.scimSyncScheduler != nil {
 		s.scimSyncScheduler.ScheduleSync(ctx)
 	}
+	notifyLogout()
 
 	// Storage operations must be executed outside of a transaction
 	profilePicturePath := path.Join("profile-pictures", userID+".png")
@@ -449,6 +466,21 @@ func (s *UserService) UpdateUser(ctx context.Context, cfg *appconfig.AppConfigMo
 		tx.Rollback()
 	}()
 
+	// Only an admin setting the flag can disable a user, so the previous state is only needed to detect that transition
+	canDisable := s.backchannelLogout != nil && !updateOwnUser && updatedUser.Disabled
+	var wasDisabled bool
+	if canDisable {
+		err := tx.
+			WithContext(ctx).
+			Model(&model.User{}).
+			Where("id = ?", userID).
+			Pluck("disabled", &wasDisabled).
+			Error
+		if err != nil {
+			return model.User{}, err
+		}
+	}
+
 	user, err := s.UpdateUserInternal(ctx, cfg, userID, updatedUser, updateOwnUser, isLdapSync, tx)
 	if err != nil {
 		return model.User{}, err
@@ -460,6 +492,11 @@ func (s *UserService) UpdateUser(ctx context.Context, cfg *appconfig.AppConfigMo
 	}
 	if s.scimSyncScheduler != nil {
 		s.scimSyncScheduler.ScheduleSync(ctx)
+	}
+
+	// A disabled user cannot sign in again, so tell their clients to end the sessions as well
+	if canDisable && !wasDisabled && user.Disabled {
+		s.backchannelLogout.NotifyUser(ctx, userID)
 	}
 
 	return user, nil
@@ -554,6 +591,11 @@ func (s *UserService) UpdateUserGroups(ctx context.Context, id string, userGroup
 		return model.User{}, err
 	}
 
+	// Only a removed group can revoke access, so adding groups skips the notification below
+	lostGroup := slices.ContainsFunc(user.UserGroups, func(group model.UserGroup) bool {
+		return !slices.Contains(userGroupIds, group.ID)
+	})
+
 	// Fetch the groups based on userGroupIds
 	var groups []model.UserGroup
 	if len(userGroupIds) > 0 {
@@ -602,6 +644,11 @@ func (s *UserService) UpdateUserGroups(ctx context.Context, id string, userGroup
 		s.scimSyncScheduler.ScheduleSync(ctx)
 	}
 
+	// Losing a group can revoke access to group-restricted clients, so tell those clients to end the user's sessions
+	if s.backchannelLogout != nil && lostGroup {
+		s.backchannelLogout.NotifyLostGroupAccess(ctx, []string{id}, "")
+	}
+
 	return user, nil
 }
 
@@ -639,16 +686,19 @@ func (s *UserService) checkDuplicatedFields(ctx context.Context, user model.User
 // ResetProfilePicture deletes a user's custom profile picture
 func (s *UserService) ResetProfilePicture(ctx context.Context, userID string) error {
 	// Validate the user ID to prevent directory traversal
-	if err := uuid.Validate(userID); err != nil {
+	_, err := uuid.Parse(userID)
+	if err != nil {
 		return apperror.InvalidUserID()
 	}
 
-	if _, err := s.GetUser(ctx, userID); err != nil {
+	_, err = s.GetUser(ctx, userID)
+	if err != nil {
 		return err
 	}
 
 	profilePicturePath := path.Join("profile-pictures", userID+".png")
-	if err := s.fileStorage.Delete(ctx, profilePicturePath); err != nil {
+	err = s.fileStorage.Delete(ctx, profilePicturePath)
+	if err != nil {
 		return fmt.Errorf("failed to delete profile picture: %w", err)
 	}
 	return nil

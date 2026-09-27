@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 )
 
 var (
@@ -94,7 +94,7 @@ func NormalizePublicKeys(raw []json.RawMessage) ([]json.RawMessage, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode key %d: %w", i+1, err)
 		}
-		normalized[i] = json.RawMessage(bytes.TrimSpace(encoded))
+		normalized[i] = bytes.TrimSpace(encoded)
 	}
 
 	return normalized, nil

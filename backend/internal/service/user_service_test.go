@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pocket-id/pocket-id/backend/internal/appconfig"
@@ -30,9 +30,10 @@ func newTestUserService(t *testing.T) (*UserService, *UserGroupService) {
 		NewCustomClaimService(db),
 		NewAppImagesService(map[string]string{}, fileStorage),
 		nil,
+		nil,
 		fileStorage,
 	)
-	groupService := NewUserGroupService(db, nil)
+	groupService := NewUserGroupService(db, nil, nil)
 
 	return userService, groupService
 }
@@ -54,7 +55,7 @@ func TestUpdateProfilePictureRejectsInvalidImageData(t *testing.T) {
 	userService, _ := newTestUserService(t)
 	config := &appconfig.AppConfigModel{RequireUserEmail: "false"}
 	user, err := userService.CreateUser(t.Context(), config, dto.UserCreateDto{
-		ID:       uuid.NewString(),
+		ID:       uuid.NewV4().String(),
 		Username: "image-test",
 	})
 	require.NoError(t, err)
@@ -70,7 +71,7 @@ func TestUpdateProfilePictureRejectsInvalidImageData(t *testing.T) {
 
 func TestProfilePictureUpdatesRejectMissingUser(t *testing.T) {
 	userService, _ := newTestUserService(t)
-	missingUserID := uuid.NewString()
+	missingUserID := uuid.NewV4().String()
 
 	err := userService.UpdateProfilePicture(t.Context(), missingUserID, strings.NewReader("not an image"))
 	require.True(t, apperror.IsCode(err, apperror.CodeUserNotFound))

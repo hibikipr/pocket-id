@@ -6,10 +6,9 @@
 	import AppConfigService from '$lib/services/app-config-service';
 	import appConfigStore from '$lib/stores/application-configuration-store';
 	import type { AllAppConfig } from '$lib/types/application-configuration.type';
-	import { axiosErrorToast } from '$lib/utils/error-util';
 	import { LucideInfo } from '@lucide/svelte';
-	import { toast } from 'svelte-sonner';
 	import AppConfigDynamicClientsForm from './forms/app-config-dynamic-clients-form.svelte';
+	import AppConfigClientSecretsForm from './forms/app-config-client-secrets-form.svelte';
 	import AppConfigEmailForm from './forms/app-config-email-form.svelte';
 	import AppConfigGeneralForm from './forms/app-config-general-form.svelte';
 	import AppConfigLdapForm from './forms/app-config-ldap-form.svelte';
@@ -19,20 +18,17 @@
 
 	let { data } = $props();
 	let appConfig = $state(data.appConfig);
+	let persistedAppConfig = { ...data.appConfig };
 
 	const appConfigService = new AppConfigService();
 
 	async function updateAppConfig(updatedAppConfig: Partial<AllAppConfig>) {
-		appConfig = await appConfigService
-			.update({
-				...appConfig,
-				...updatedAppConfig
-			})
-			.catch((e) => {
-				axiosErrorToast(e);
-				throw e;
-			});
-		await appConfigStore.reload();
+		persistedAppConfig = await appConfigService.update({
+			...persistedAppConfig,
+			...updatedAppConfig
+		});
+
+		appConfigStore.set({ ...$appConfigStore, ...persistedAppConfig });
 	}
 
 	async function updateImages(
@@ -84,9 +80,7 @@
 			defaultProfilePicturePromise,
 			backgroundImagePromise,
 			faviconPromise
-		])
-			.then(() => toast.success(m.images_updated_successfully()))
-			.catch(axiosErrorToast);
+		]);
 	}
 </script>
 
@@ -198,7 +192,16 @@
 		</Card.Root>
 	</Tabs.Content>
 
-	<Tabs.Content value="oidc" id="application-configuration-oidc">
+	<Tabs.Content value="oidc" id="application-configuration-oidc" class="flex flex-col gap-4">
+		<Card.Root>
+			<Card.Header>
+				<Card.Title>{m.general()}</Card.Title>
+			</Card.Header>
+			<Card.Content>
+				<AppConfigClientSecretsForm {appConfig} callback={updateAppConfig} />
+			</Card.Content>
+		</Card.Root>
+
 		<Card.Root>
 			<Card.Header>
 				<Card.Title>{m.client_id_metadata_documents()}</Card.Title>
